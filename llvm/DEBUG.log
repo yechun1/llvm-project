@@ -1,0 +1,3 @@
++#define LLVM_DEBUG2(X) do { X; } while (false)
++#undef NDEBUG
+
