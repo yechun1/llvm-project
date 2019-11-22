@@ -1,0 +1,223 @@
+From f01827f2d1bdaff14cf1cf176e8a69e308d5371e Mon Sep 17 00:00:00 2001
+From: Vedant Kumar <vsk@apple.com>
+Date: Tue, 19 Jun 2018 23:42:17 +0000
+Subject: [PATCH] [IR] Introduce helpers to skip debug instructions (NFC)
+
+This patch introduces two helpers to make it easier to ignore debug
+intrinsics:
+
+- Instruction::getNextNonDebugInstruction()
+
+This is just like Instruction::getNextNode(), except that it skips debug
+info.
+
+- skipDebugInfo(BasicBlock::iterator)
+
+A free function which advances a BasicBlock iterator past any debug
+info. This is a no-op when the iterator already points to a non-debug
+instruction.
+
+Part of: llvm.org/PR37728
+Related to: https://reviews.llvm.org/D47874
+
+Differential Revision: https://reviews.llvm.org/D48305
+
+llvm-svn: 335083
+---
+ llvm/include/llvm/IR/BasicBlock.h             |  4 ++
+ llvm/include/llvm/IR/Instruction.h            |  8 +++
+ llvm/lib/IR/BasicBlock.cpp                    |  6 +++
+ llvm/lib/IR/Instruction.cpp                   |  8 +++
+ .../InstCombine/InstCombineCalls.cpp          | 14 ++----
+ llvm/unittests/IR/InstructionsTest.cpp        | 49 +++++++++++++++++++
+ 6 files changed, 78 insertions(+), 11 deletions(-)
+
+diff --git a/llvm/include/llvm/IR/BasicBlock.h b/llvm/include/llvm/IR/BasicBlock.h
+index c942ec83f66..57f47aa44cf 100644
+--- a/llvm/include/llvm/IR/BasicBlock.h
++++ b/llvm/include/llvm/IR/BasicBlock.h
+@@ -433,6 +433,10 @@ private:
+ // Create wrappers for C Binding types (see CBindingWrapping.h).
+ DEFINE_SIMPLE_CONVERSION_FUNCTIONS(BasicBlock, LLVMBasicBlockRef)
+ 
++/// Advance \p It while it points to a debug instruction and return the result.
++/// This assumes that \p It is not at the end of a block.
++BasicBlock::iterator skipDebugInfo(BasicBlock::iterator It);
++
+ } // end namespace llvm
+ 
+ #endif // LLVM_IR_BASICBLOCK_H
+diff --git a/llvm/include/llvm/IR/Instruction.h b/llvm/include/llvm/IR/Instruction.h
+index dddea3e11f7..090e7cc021d 100644
+--- a/llvm/include/llvm/IR/Instruction.h
++++ b/llvm/include/llvm/IR/Instruction.h
+@@ -556,6 +556,14 @@ public:
+     }
+   }
+ 
++  /// Return a pointer to the next non-debug instruction in the same basic
++  /// block as 'this', or nullptr if no such instruction exists.
++  const Instruction *getNextNonDebugInstruction() const;
++  Instruction *getNextNonDebugInstruction() {
++    return const_cast<Instruction *>(
++        static_cast<const Instruction *>(this)->getNextNonDebugInstruction());
++  }
++
+   /// Create a copy of 'this' instruction that is identical in all ways except
+   /// the following:
+   ///   * The instruction has no parent
+diff --git a/llvm/lib/IR/BasicBlock.cpp b/llvm/lib/IR/BasicBlock.cpp
+index c103de4fa34..005a77261f9 100644
+--- a/llvm/lib/IR/BasicBlock.cpp
++++ b/llvm/lib/IR/BasicBlock.cpp
+@@ -479,3 +479,9 @@ Optional<uint64_t> BasicBlock::getIrrLoopHeaderWeight() const {
+   }
+   return Optional<uint64_t>();
+ }
++
++BasicBlock::iterator llvm::skipDebugInfo(BasicBlock::iterator It) {
++  while (isa<DbgInfoIntrinsic>(It))
++    ++It;
++  return It;
++}
+diff --git a/llvm/lib/IR/Instruction.cpp b/llvm/lib/IR/Instruction.cpp
+index a604120002e..508db9bcaf1 100644
+--- a/llvm/lib/IR/Instruction.cpp
++++ b/llvm/lib/IR/Instruction.cpp
+@@ -12,6 +12,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "llvm/IR/Instruction.h"
++#include "llvm/IR/IntrinsicInst.h"
+ #include "llvm/ADT/DenseSet.h"
+ #include "llvm/IR/Constants.h"
+ #include "llvm/IR/Instructions.h"
+@@ -594,6 +595,13 @@ bool Instruction::isSafeToRemove() const {
+          !isa<TerminatorInst>(this);
+ }
+ 
++const Instruction *Instruction::getNextNonDebugInstruction() const {
++  for (const Instruction *I = getNextNode(); I; I = I->getNextNode())
++    if (!isa<DbgInfoIntrinsic>(I))
++      return I;
++  return nullptr;
++}
++
+ bool Instruction::isAssociative() const {
+   unsigned Opcode = getOpcode();
+   if (isAssociative(Opcode))
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+index 9e046c9e3a6..3dde762dbcc 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+@@ -3614,13 +3614,8 @@ Instruction *InstCombiner::visitCallInst(CallInst &CI) {
+     // happen when variable allocas are DCE'd.
+     if (IntrinsicInst *SS = dyn_cast<IntrinsicInst>(II->getArgOperand(0))) {
+       if (SS->getIntrinsicID() == Intrinsic::stacksave) {
+-        // Skip over debug info instructions.
+-        // FIXME: This should be an utility in Instruction.h
+-        auto It = SS->getIterator();
+-        It++;
+-        while (isa<DbgInfoIntrinsic>(*It))
+-          It++;
+-        if (&*It == II) {
++        // Skip over debug info.
++        if (SS->getNextNonDebugInstruction() == II) {
+           return eraseInstFromFunction(CI);
+         }
+       }
+@@ -3804,10 +3799,7 @@ Instruction *InstCombiner::visitCallInst(CallInst &CI) {
+ // Fence instruction simplification
+ Instruction *InstCombiner::visitFenceInst(FenceInst &FI) {
+   // Remove identical consecutive fences.
+-  Instruction *Next = FI.getNextNode();
+-  while (Next != nullptr && isa<DbgInfoIntrinsic>(Next))
+-    Next = Next->getNextNode();
+-
++  Instruction *Next = FI.getNextNonDebugInstruction();
+   if (auto *NFI = dyn_cast<FenceInst>(Next))
+     if (FI.isIdenticalTo(NFI))
+       return eraseInstFromFunction(FI);
+diff --git a/llvm/unittests/IR/InstructionsTest.cpp b/llvm/unittests/IR/InstructionsTest.cpp
+index 40a1d826d06..69e74544a90 100644
+--- a/llvm/unittests/IR/InstructionsTest.cpp
++++ b/llvm/unittests/IR/InstructionsTest.cpp
+@@ -7,6 +7,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "llvm/AsmParser/Parser.h"
+ #include "llvm/IR/Instructions.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/Analysis/ValueTracking.h"
+@@ -21,6 +22,7 @@
+ #include "llvm/IR/Module.h"
+ #include "llvm/IR/NoFolder.h"
+ #include "llvm/IR/Operator.h"
++#include "llvm/Support/SourceMgr.h"
+ #include "gmock/gmock-matchers.h"
+ #include "gtest/gtest.h"
+ #include <memory>
+@@ -28,6 +30,14 @@
+ namespace llvm {
+ namespace {
+ 
++static std::unique_ptr<Module> parseIR(LLVMContext &C, const char *IR) {
++  SMDiagnostic Err;
++  std::unique_ptr<Module> Mod = parseAssemblyString(IR, Err, C);
++  if (!Mod)
++    Err.print("InstructionsTests", errs());
++  return Mod;
++}
++
+ TEST(InstructionsTest, ReturnInst) {
+   LLVMContext C;
+ 
+@@ -829,5 +839,44 @@ TEST(InstructionsTest, ShuffleMaskQueries) {
+   EXPECT_TRUE(ShuffleVectorInst::isTransposeMask(ConstantVector::get({C1, C3})));
+ }
+ 
++TEST(InstructionsTest, SkipDebug) {
++  LLVMContext C;
++  std::unique_ptr<Module> M = parseIR(C,
++                                      R"(
++      declare void @llvm.dbg.value(metadata, metadata, metadata)
++
++      define void @f() {
++      entry:
++        call void @llvm.dbg.value(metadata i32 0, metadata !11, metadata !DIExpression()), !dbg !13
++        ret void
++      }
++
++      !llvm.dbg.cu = !{!0}
++      !llvm.module.flags = !{!3, !4}
++      !0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !1, producer: "clang version 6.0.0", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, enums: !2)
++      !1 = !DIFile(filename: "t2.c", directory: "foo")
++      !2 = !{}
++      !3 = !{i32 2, !"Dwarf Version", i32 4}
++      !4 = !{i32 2, !"Debug Info Version", i32 3}
++      !8 = distinct !DISubprogram(name: "f", scope: !1, file: !1, line: 1, type: !9, isLocal: false, isDefinition: true, scopeLine: 1, isOptimized: false, unit: !0, retainedNodes: !2)
++      !9 = !DISubroutineType(types: !10)
++      !10 = !{null}
++      !11 = !DILocalVariable(name: "x", scope: !8, file: !1, line: 2, type: !12)
++      !12 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
++      !13 = !DILocation(line: 2, column: 7, scope: !8)
++  )");
++  ASSERT_TRUE(M);
++  Function *F = cast<Function>(M->getNamedValue("f"));
++  BasicBlock &BB = F->front();
++
++  // The first non-debug instruction is the terminator.
++  auto *Term = BB.getTerminator();
++  EXPECT_EQ(Term, BB.begin()->getNextNonDebugInstruction());
++  EXPECT_EQ(Term->getIterator(), skipDebugInfo(BB.begin()));
++
++  // After the terminator, there are no non-debug instructions.
++  EXPECT_EQ(nullptr, Term->getNextNonDebugInstruction());
++}
++
+ } // end anonymous namespace
+ } // end namespace llvm
+-- 
+2.17.1
+

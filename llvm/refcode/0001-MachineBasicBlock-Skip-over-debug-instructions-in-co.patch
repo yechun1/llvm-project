@@ -1,0 +1,50 @@
+From 42d77461f3298d5b7bf09208d67a3d8bb28df065 Mon Sep 17 00:00:00 2001
+From: Craig Topper <craig.topper@intel.com>
+Date: Fri, 1 Nov 2019 14:06:52 -0700
+Subject: [PATCH] [MachineBasicBlock] Skip over debug instructions in
+ computeRegisterLiveness before checking for begin
+
+If there are debug instructions before the stopping point,
+we need to skip over them before checking for begin in order
+to avoid having the debug instructions effect behavior.
+
+Fixes PR43758.
+
+Differential Revision: https://reviews.llvm.org/D69606
+---
+ llvm/lib/CodeGen/MachineBasicBlock.cpp | 5 +++++
+ llvm/test/CodeGen/X86/leaFixup64.mir   | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/CodeGen/MachineBasicBlock.cpp b/llvm/lib/CodeGen/MachineBasicBlock.cpp
+index 854bef3aab0..71354ea4345 100644
+--- a/llvm/lib/CodeGen/MachineBasicBlock.cpp
++++ b/llvm/lib/CodeGen/MachineBasicBlock.cpp
+@@ -1462,6 +1462,11 @@ MachineBasicBlock::computeRegisterLiveness(const TargetRegisterInfo *TRI,
+     } while (I != begin() && N > 0);
+   }
+ 
++  // If all the instructions before this in the block are debug instructions,
++  // skip over them.
++  while (I != begin() && std::prev(I)->isDebugInstr())
++    --I;
++
+   // Did we get to the start of the block?
+   if (I == begin()) {
+     // If so, the register's state is definitely defined by the live-in state.
+diff --git a/llvm/test/CodeGen/X86/leaFixup64.mir b/llvm/test/CodeGen/X86/leaFixup64.mir
+index 931a5720579..673d43ea71a 100644
+--- a/llvm/test/CodeGen/X86/leaFixup64.mir
++++ b/llvm/test/CodeGen/X86/leaFixup64.mir
+@@ -1169,7 +1169,7 @@ body:             |
+     ; CHECK: NOOP
+     ; CHECK: NOOP
+     ; CHECK: NOOP
+-    ; CHECK: $ebp = LEA64_32r killed $rbp, 1, killed $rax, 0, $noreg
++    ; CHECK: $ebp = ADD32rr $ebp, $eax, implicit-def $eflags, implicit $rbp, implicit $rax
+     ; CHECK: NOOP
+     ; CHECK: NOOP
+     ; CHECK: NOOP
+-- 
+2.17.1
+

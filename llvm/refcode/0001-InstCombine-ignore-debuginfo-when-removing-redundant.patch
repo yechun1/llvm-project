@@ -1,0 +1,63 @@
+From 825a4faa8d655d1b753bdd737cc2648adc0ac3c8 Mon Sep 17 00:00:00 2001
+From: Sanjay Patel <spatel@rotateright.com>
+Date: Wed, 20 Jun 2018 13:22:26 +0000
+Subject: [PATCH] [InstCombine] ignore debuginfo when removing redundant
+ assumes (PR37726)
+
+This is similar to:
+rL335083
+
+Fixes::
+https://bugs.llvm.org/show_bug.cgi?id=37726
+
+llvm-svn: 335121
+---
+ llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp | 8 +++++---
+ llvm/test/Transforms/InstCombine/assume.ll           | 5 ++---
+ 2 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+index 3dde762dbcc..dd88b33546b 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+@@ -3672,9 +3672,11 @@ Instruction *InstCombiner::visitCallInst(CallInst &CI) {
+     break;
+   case Intrinsic::assume: {
+     Value *IIOperand = II->getArgOperand(0);
+-    // Remove an assume if it is immediately followed by an identical assume.
+-    if (match(II->getNextNode(),
+-              m_Intrinsic<Intrinsic::assume>(m_Specific(IIOperand))))
++    // Remove an assume if it is followed by an identical assume.
++    // TODO: Do we need this? Unless there are conflicting assumptions, the
++    // computeKnownBits(IIOperand) below here eliminates redundant assumes.
++    Instruction *Next = II->getNextNonDebugInstruction();
++    if (match(Next, m_Intrinsic<Intrinsic::assume>(m_Specific(IIOperand))))
+       return eraseInstFromFunction(CI);
+ 
+     // Canonicalize assume(a && b) -> assume(a); assume(b);
+diff --git a/llvm/test/Transforms/InstCombine/assume.ll b/llvm/test/Transforms/InstCombine/assume.ll
+index 3bb7eb558e4..f861741db26 100644
+--- a/llvm/test/Transforms/InstCombine/assume.ll
++++ b/llvm/test/Transforms/InstCombine/assume.ll
+@@ -295,16 +295,15 @@ define i32 @assumption_conflicts_with_known_bits(i32 %a, i32 %b) {
+ ; FIXME:
+ ; PR37726 - https://bugs.llvm.org/show_bug.cgi?id=37726
+ ; There's a loophole in eliminating a redundant assumption when
+-; we have conflicting assumptions. Verify that debuginfo doesn't 
++; we have conflicting assumptions. Verify that debuginfo doesn't
+ ; get in the way of the fold.
+- 
++
+ define void @debug_interference(i8 %x) {
+ ; CHECK-LABEL: @debug_interference(
+ ; CHECK-NEXT:    [[CMP1:%.*]] = icmp eq i8 [[X:%.*]], 0
+ ; CHECK-NEXT:    tail call void @llvm.dbg.value(metadata i32 5, metadata !7, metadata !DIExpression()), !dbg !9
+ ; CHECK-NEXT:    tail call void @llvm.assume(i1 [[CMP1]])
+ ; CHECK-NEXT:    tail call void @llvm.dbg.value(metadata i32 5, metadata !7, metadata !DIExpression()), !dbg !9
+-; CHECK-NEXT:    tail call void @llvm.assume(i1 false)
+ ; CHECK-NEXT:    tail call void @llvm.dbg.value(metadata i32 5, metadata !7, metadata !DIExpression()), !dbg !9
+ ; CHECK-NEXT:    tail call void @llvm.assume(i1 false)
+ ; CHECK-NEXT:    ret void
+-- 
+2.17.1
+
